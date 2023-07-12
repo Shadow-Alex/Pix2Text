@@ -1,7 +1,7 @@
 # coding: utf-8
 # Copyright (C) 2022-2023, [Breezedeus](https://www.breezedeus.com).
 
-import os
+import os, cv2
 from glob import glob
 import logging
 from itertools import chain
@@ -17,7 +17,8 @@ from cnstd.utils import get_model_file
 from cnstd import LayoutAnalyzer
 from cnstd.yolov7.consts import CATEGORY_DICT
 
-from .utils import sort_boxes, rotated_box_to_horizontal, is_valid_box, list2box
+from .utils import sort_boxes, rotated_box_to_horizontal, is_valid_box, list2box, merge_boxes, split_box, \
+    trim_equations, intersection_area, bbox8_to_bbox4, split_equations
 from cnstd.yolov7.general import xyxy24p, box_partial_overlap
 
 from .consts import (
@@ -35,7 +36,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 DEFAULT_CONFIGS = {
     'analyzer': {'model_name': 'mfd'},
@@ -68,16 +68,16 @@ class Pix2Text(object):
     MODEL_FILE_PREFIX = 'pix2text-v{}'.format(MODEL_VERSION)
 
     def __init__(
-        self,
-        *,
-        analyzer_config: Dict[str, Any] = None,
-        clf_config: Dict[str, Any] = None,
-        general_config: Dict[str, Any] = None,
-        english_config: Dict[str, Any] = None,
-        formula_config: Dict[str, Any] = None,
-        thresholds: Dict[str, Any] = None,
-        device: str = 'cpu',  # ['cpu', 'cuda', 'gpu']
-        **kwargs,
+            self,
+            *,
+            analyzer_config: Dict[str, Any] = None,
+            clf_config: Dict[str, Any] = None,
+            general_config: Dict[str, Any] = None,
+            english_config: Dict[str, Any] = None,
+            formula_config: Dict[str, Any] = None,
+            thresholds: Dict[str, Any] = None,
+            device: str = 'cpu',  # ['cpu', 'cuda', 'gpu']
+            **kwargs,
     ):
         """
 
@@ -113,6 +113,12 @@ class Pix2Text(object):
         )
 
         self.analyzer = LayoutAnalyzer(**analyzer_config)
+        self.layout_analyzer = LayoutAnalyzer(
+            model_name='layout',
+            model_type='yolov7',
+            model_backend='pytorch',
+            device='gpu'
+        )
 
         _clf_config = deepcopy(clf_config)
         _clf_config.pop('model_dir')
@@ -126,13 +132,13 @@ class Pix2Text(object):
         self._assert_and_prepare_clf_model(clf_config)
 
     def _prepare_configs(
-        self,
-        analyzer_config,
-        clf_config,
-        general_config,
-        english_config,
-        formula_config,
-        device,
+            self,
+            analyzer_config,
+            clf_config,
+            general_config,
+            english_config,
+            formula_config,
+            device,
     ):
         def _to_default(_conf, _def_val):
             if not _conf:
@@ -195,12 +201,12 @@ class Pix2Text(object):
         )
 
     def __call__(
-        self, img: Union[str, Path, Image.Image], **kwargs
+            self, img: Union[str, Path, Image.Image], **kwargs
     ) -> List[Dict[str, Any]]:
         return self.recognize(img, **kwargs)
 
     def recognize(
-        self, img: Union[str, Path, Image.Image], use_analyzer: bool = True, **kwargs
+            self, img: Union[str, Path, Image.Image], use_analyzer: bool = True, **kwargs
     ) -> List[Dict[str, Any]]:
         """
         对图片先做版面分析，然后再识别每块中包含的信息。在版面分析未识别出内容时，则把整个图片作为整体进行识别。
@@ -231,7 +237,7 @@ class Pix2Text(object):
         return out
 
     def recognize_by_clf(
-        self, img: Union[str, Path, Image.Image], **kwargs
+            self, img: Union[str, Path, Image.Image], **kwargs
     ) -> List[Dict[str, Any]]:
         """
         把整张图片作为一整块进行识别。
@@ -273,7 +279,7 @@ class Pix2Text(object):
         return [{'type': image_type, 'text': result, 'position': box}]
 
     def recognize_by_mfd(
-        self, img: Union[str, Path, Image.Image], **kwargs
+            self, img: Union[str, Path, Image.Image], **kwargs
     ) -> List[Dict[str, Any]]:
         """
         对图片先做MFD 或 版面分析，然后再识别每块中包含的信息。
@@ -305,12 +311,22 @@ class Pix2Text(object):
         ratio = resized_shape / w
         resized_shape = (int(h * ratio), resized_shape)  # (H, W)
         analyzer_outs = self.analyzer(img0.copy(), resized_shape=resized_shape)
-        logger.debug('MFD Result: %s', analyzer_outs)
         embed_sep = kwargs.get('embed_sep', (' $', '$ '))
         isolated_sep = kwargs.get('isolated_sep', ('$$\n', '\n$$'))
 
+        hires_outs = self.layout_analyzer(img0.copy(), resized_shape=(1280, 1280))
+
+        # 首先融合 hi-res layout 识别出来的公式与 mfd 识别出来的公式范围，取最大的范围！
+        merged_outs = merge_boxes(hires_outs, analyzer_outs)
+
+        # 如果 Text 和 Isolated Equation 有交集，修剪公式的 bbox
+        merged_outs = trim_equations(hires_outs, merged_outs)
+
+        # 对于融合之后的每个 bbox，再使用分行算法找到空白行并加以切割，拆分成单行公式，生成新的 bbox。
+        splitted_outs = split_equations(merged_outs, img0)
+
         mf_out = []
-        for box_info in analyzer_outs:
+        for box_info in splitted_outs:
             box = box_info['box']
             xmin, ymin, xmax, ymax = (
                 int(box[0][0]),
@@ -320,14 +336,27 @@ class Pix2Text(object):
             )
             crop_patch = img0.crop((xmin, ymin, xmax, ymax))
             patch_out = self._latex(crop_patch)
+            if patch_out == '':
+                continue
             sep = isolated_sep if box_info['type'] == 'isolated' else embed_sep
             text = sep[0] + patch_out + sep[1]
             mf_out.append({'type': box_info['type'], 'text': text, 'position': box})
 
         img = np.array(img0.copy())
         # 把公式部分mask掉，然后对其他部分进行OCR
-        for box_info in analyzer_outs:
+        for box_info in splitted_outs:
             if box_info['type'] in ('isolated', 'embedding'):
+                box = box_info['box']
+                xmin, ymin = max(0, int(box[0][0]) - 1), max(0, int(box[0][1]) - 1)
+                xmax, ymax = (
+                    min(img0.size[0], int(box[2][0]) + 1),
+                    min(img0.size[1], int(box[2][1]) + 1),
+                )
+                img[ymin:ymax, xmin:xmax, :] = 255
+
+        # 把 Table & Figure 部分mask掉
+        for box_info in hires_outs:
+            if box_info['type'] in ('Table', 'Figure'):
                 box = box_info['box']
                 xmin, ymin = max(0, int(box[0][0]) - 1), max(0, int(box[0][1]) - 1)
                 xmax, ymax = (
@@ -376,10 +405,9 @@ class Pix2Text(object):
                 outs.append(box)
 
         outs = sort_boxes(outs, key='position')
-        logger.debug(outs)
-        outs = self._post_process(outs)
 
-        outs = list(chain(*outs))
+        outs = self._custom_process(outs, hires_outs, w)
+
         if kwargs.get('save_analysis_res'):
             save_layout_img(
                 img0,
@@ -394,13 +422,132 @@ class Pix2Text(object):
     def _post_process(cls, outs):
         for line_boxes in outs:
             if (
-                len(line_boxes) > 1
-                and line_boxes[-1]['type'] == 'text'
-                and line_boxes[-2]['type'] != 'text'
+                    len(line_boxes) > 1
+                    and line_boxes[-1]['type'] == 'text'
+                    and line_boxes[-2]['type'] != 'text'
             ):
                 if line_boxes[-1]['text'].lower() == 'o':
                     line_boxes[-1]['text'] = '。'
         return outs
+
+    @classmethod
+    def _custom_process(cls, outs, layout, width):
+        """
+        适配单列版面、双列版面。
+        适配英文连字符。
+        根据 layout 生成换行符。
+        """
+        def max_layout_id(layout, bbox_input):
+            bbox_input = bbox8_to_bbox4(bbox_input)
+
+            max_ratio = 0
+            max_id = -1
+            bbox_input_area = (bbox_input[2] - bbox_input[0]) * (bbox_input[3] - bbox_input[1])
+
+            for i, bbox in enumerate(layout):
+                layout_bbox = bbox8_to_bbox4(bbox['box'])
+                inter_area = intersection_area(layout_bbox, bbox_input)
+                ratio = inter_area / bbox_input_area
+
+                if ratio > max_ratio:
+                    max_ratio = ratio
+                    max_id = i
+
+            return max_ratio, max_id
+
+        def max_layout_type(layout, bbox_input):
+            _, max_id = max_layout_id(layout, bbox_input)
+            return layout[max_id]['type'] if max_id != -1 else "IDK"
+
+        global last_layout_id
+
+        def layout_sensitive_str(out, layout):
+            global last_layout_id
+            max_ratio, cur_id = max_layout_id(layout, out['position'])
+            # if in same id. no \n.
+            # -1 为通配符。
+            out_text = out['text'].lstrip(' \n').rstrip(' \n')
+            ret = ''
+            if len(out_text) <= 0:
+                return ''
+            # 和之前不属于同一块。换行。例外：之前有 -，使得 last_layout_id = -1
+            if cur_id != last_layout_id and out_text != '' and last_layout_id != -1:
+                ret += '\n'
+            try:
+                if layout[last_layout_id]['type'] == 'Equation':
+                    ret += '\n'
+            except:
+                pass
+            ret += out_text
+            if ret[-1] == '-':
+                last_layout_id = -1
+                ret = ret[:-1]
+            else:
+                last_layout_id = cur_id
+                ret += ' '
+            return ret
+
+        new_out = []
+        right_list = []  # right-side cache.
+        mid = width / 2
+
+        global last_layout_id
+        last_layout_id = -1
+        for line in outs:
+            # bugfix ：Header 和 Footer 属性传播，只要同行中有一个是，就认为其他都是！
+            skip_line = False
+            for out in line:
+                out_type = max_layout_type(layout, out['position'])
+                if out_type in ("Header", "Footer"):
+                    for out_ in line:
+                        out_['type'] = out_type
+                        new_out.append(out_)
+                    skip_line = True
+                    break
+            if skip_line :
+                continue
+
+            # 推断本行单列还是双列：如果mid处有box，则认为是单列。
+            double_col = True
+            for out in line:
+                if min(point[0] for point in out['position']) < mid < max(
+                        point[0] for point in out['position']):
+                    double_col = False
+                    break
+
+            for out in line:
+                out_type = max_layout_type(layout, out['position'])
+                if out_type in ("Table", "Figure"):
+                    continue
+                if out_type in ("Reference", "Table caption", "Figure caption"):
+                    out['type'] = out_type
+                    new_out.append(out)
+                    continue
+
+                if not double_col:
+                    # flush right list.
+                    for cached in right_list:
+                        new_out.append(dict(position=cached['position'],
+                                            text=layout_sensitive_str(cached, layout),
+                                            type='Text'))
+                    right_list = []
+                    new_out.append(dict(position=out['position'],
+                                        text=layout_sensitive_str(out, layout),
+                                        type='Text'))
+
+                elif mid > max(point[0] for point in out['position']):
+                    new_out.append(dict(position=out['position'],
+                                        text=layout_sensitive_str(out, layout),
+                                        type='Text'))
+                else:
+                    right_list.append(out)
+        # flush.
+        for cached in right_list:
+            new_out.append(dict(position=cached['position'],
+                                text=layout_sensitive_str(cached, layout),
+                                type='Text'))
+
+        return new_out
 
     @classmethod
     def _split_line_image(cls, line_box, embed_mfs):
@@ -423,7 +570,7 @@ class Pix2Text(object):
         return outs
 
     def recognize_by_layout(
-        self, img: Union[str, Path, Image.Image], **kwargs
+            self, img: Union[str, Path, Image.Image], **kwargs
     ) -> List[Dict[str, Any]]:
         """
         对图片先做版面分析，然后再识别每块中包含的信息。
@@ -468,7 +615,7 @@ class Pix2Text(object):
                 if res[0] == 'formula':
                     image_type = 'general'
                 elif (
-                    res[1] < self.thresholds['english2general'] and res[0] == 'english'
+                        res[1] < self.thresholds['english2general'] and res[0] == 'english'
                 ):
                     image_type = 'general'
                 patch_out = self._ocr(crop_patch, image_type)

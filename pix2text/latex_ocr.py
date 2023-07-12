@@ -325,11 +325,15 @@ class LatexOCR(object):
         else:
             img = np.array(pad(img).convert('RGB'))
             t = test_transform(image=img)['image'][:1].unsqueeze(0)
-        im = t.to(self.args.device)
+        
+        try:
+            im = t.to(self.args.device)
 
-        dec = self.model.generate(
-            im.to(self.args.device), temperature=self.args.get('temperature', 0.25)
-        )
-        pred = post_process(token2str(dec, self.tokenizer)[0])
-        pred = post_post_process_latex(pred)
+            dec = self.model.generate(
+                im.to(self.args.device), temperature=self.args.get('temperature', 0.25)
+            )
+            pred = post_process(token2str(dec, self.tokenizer)[0])
+            pred = post_post_process_latex(pred)
+        except:
+            pred = ''
         return pred

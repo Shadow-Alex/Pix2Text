@@ -1,6 +1,5 @@
 package:
-	rm -rf build
-	python setup.py sdist bdist_wheel
+	pip install -e .
 
 VERSION = 0.2.3
 upload:

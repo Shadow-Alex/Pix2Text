@@ -16,7 +16,7 @@ from numpy import random
 import torch
 from torch import Tensor
 from torchvision.utils import save_image
-
+from shapely.geometry import box
 
 fmt = '[%(levelname)s %(asctime)s %(funcName)s:%(lineno)d] %(' 'message)s '
 logging.basicConfig(format=fmt)
@@ -258,7 +258,8 @@ def get_same_line_boxes(anchor, total_boxes):
     for box in total_boxes:
         if box['line_number'] >= 0:
             continue
-        if max([overlap(box, l_box) for l_box in line_boxes]) > 0.1:
+        # if max([overlap(box, l_box) for l_box in line_boxes]) > 0.1:
+        if overlap(box, anchor) > 0.5 :
             line_boxes.append(box)
     return line_boxes
 
@@ -467,3 +468,193 @@ def merge_line_texts(
 
     out = smart_join(res_line_texts)
     return out.replace(line_sep + line_sep, line_sep)  # 把 '\n\n' 替换为 '\n'
+
+def merge_boxes(list1, list2):
+    """
+    融合 list1、list2中的公式识别结果。
+    如今 mfd、layout 在公式识别上各有所长，融合结果以获取更高精度。
+    """
+    to_be_merged = []
+    pass_through = []
+    for entry in list1 + list2:
+        if entry['type'] in ('Equation', 'isolated'):
+            to_be_merged.append(entry)
+        elif entry['type'] == 'embedding':
+            pass_through.append(entry)
+
+    while True:
+        new_merged = []
+        is_merged = False
+        skip_i = -1
+        skip_j = -1
+        for i in range(len(to_be_merged)):
+            for j in range(i+1, len(to_be_merged)):
+                box1 = box(
+                    minx=min(point[0] for point in to_be_merged[i]['box']),
+                    miny=min(point[1] for point in to_be_merged[i]['box']),
+                    maxx=max(point[0] for point in to_be_merged[i]['box']),
+                    maxy=max(point[1] for point in to_be_merged[i]['box']),
+                )
+                box2 = box(
+                    minx=min(point[0] for point in to_be_merged[j]['box']),
+                    miny=min(point[1] for point in to_be_merged[j]['box']),
+                    maxx=max(point[0] for point in to_be_merged[j]['box']),
+                    maxy=max(point[1] for point in to_be_merged[j]['box']),
+                )
+                if box1.intersects(box2):
+                    merged_box = box1.union(box2)
+                    minx, miny, maxx, maxy = merged_box.bounds
+                    new_merged.append({'type': 'isolated',
+                                       'box': np.array([[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy]]),
+                                       'score': (to_be_merged[i]['score'] + to_be_merged[j]['score']) / 2.})
+                    is_merged = True
+                    skip_j = j
+                    skip_i = i
+                    break
+            if is_merged:
+                break
+
+        if not is_merged:
+            break
+        else:
+            for i in range(len(to_be_merged)):
+                if i not in (skip_i, skip_j):
+                    new_merged.append(to_be_merged[i])
+            to_be_merged = new_merged
+
+    return to_be_merged + pass_through
+
+def split_box(img):
+    """
+    通过留白将多行公式拆分成多个 bbox，以提升识别精准度
+    :return: 拆分 y 值，如果输入是单行公式，将只返回 img.height
+    """
+    #
+    img_gray = img.convert('L')
+    # 二值化
+    threshold = 128
+    img_binary = img_gray.point(lambda p: p > threshold and 255)
+    # 投影
+    np_img = np.array(img_binary)
+    projection = np.sum(np_img, axis=1)
+    blanks = np.where(projection == img.width * 255)[0]
+
+    def merge_intervals(nums):
+        if len(nums) < 1:
+            return []
+
+        intervals = [[nums[0], nums[0]]]
+        for i in nums[1:]:
+            if i == intervals[-1][1] + 1:
+                intervals[-1][1] = i
+            else:
+                intervals.append([i, i])
+        return intervals
+
+    def filter_intervals(intervals, min_width):
+        # 对于过小的空白，可能是分式，不拆分。
+        return [i for i in intervals if i[1] - i[0] >= min_width]
+
+    def compute_midpoints(intervals):
+        return [int((i[0] + i[1]) / 2) for i in intervals]
+
+    intervals = merge_intervals(blanks)
+    filtered = filter_intervals(intervals, 10)
+    if len(filtered) >= 1:
+        if filtered[0][0] == 0:
+            filtered = filtered[1:]
+    if len(filtered) >= 1:
+        if filtered[-1][1] == img.height - 1:
+            filtered = filtered[:-1]
+    midpoints = compute_midpoints(filtered)
+    midpoints = midpoints + [img.height]
+
+    return midpoints
+
+def intersection_area(bbox1, bbox2):
+    x1 = max(bbox1[0], bbox2[0])
+    y1 = max(bbox1[1], bbox2[1])
+    x2 = min(bbox1[2], bbox2[2])
+    y2 = min(bbox1[3], bbox2[3])
+
+    if x1 < x2 and y1 < y2:
+        return (x2 - x1) * (y2 - y1)
+    else:
+        return 0
+
+
+def bbox8_to_bbox4(bbox_8):
+    out = []
+    out.append(min(point[0] for point in bbox_8))
+    out.append(min(point[1] for point in bbox_8))
+    out.append(max(point[0] for point in bbox_8))
+    out.append(max(point[1] for point in bbox_8))
+    return out
+
+def trim_equations(hires_outs, merged_outs):
+    """
+    使用 layout 所得结果，对 isolated 型公式范围加以修正，
+    主要针对
+    (1) $blablablabla$
+    :inputs:
+        hires_outs: layout analysis 结果
+        merged_outs: 公式 bboxs，如果追求精度，推荐联合使用mfd与layout。
+    """
+    import copy
+    merged_outs = copy.deepcopy(merged_outs)
+    for idx, out in enumerate(merged_outs):
+        if out['type'] not in ('isolated', 'Equation'):
+            continue
+
+        out_bbox4 = bbox8_to_bbox4(out['box'])
+        for hires_box in hires_outs:
+            if hires_box['type'] != 'Text':
+                continue
+            hires_box4 = bbox8_to_bbox4(hires_box['box'])
+
+            if intersection_area(out_bbox4, hires_box4) > 0:
+                Ax1, Ay1, Ax2, Ay2 = out_bbox4
+                Bx1, By1, Bx2, By2 = hires_box4
+                # A 在B的右边，侵占了B的区域
+                if Bx1 < Ax1 < Bx2 < Ax2:
+                    merged_outs[idx]['box'][0][0] = Bx2
+                    merged_outs[idx]['box'][3][0] = Bx2
+                # A 在B的左边，侵占了B的区域
+                elif Ax1 < Bx1 < Ax2 < Bx2:
+                    merged_outs[idx]['box'][1][0] = Bx1
+                    merged_outs[idx]['box'][2][0] = Bx1
+
+    return merged_outs
+
+def split_equations(merged_outs, img0):
+    splitted_outs = []
+    for box_info in merged_outs:
+        if box_info['type'] == 'embedding':
+            splitted_outs.append(box_info)
+            continue
+        # isolated. might be multi-line.
+        box = box_info['box']
+        xmin = min(point[0] for point in box)
+        xmax = max(point[0] for point in box)
+        ymin = min(point[1] for point in box)
+        ymax = max(point[1] for point in box)
+        crop_patch = img0.crop((xmin, ymin, xmax, ymax))
+
+        splitted_ys = split_box(crop_patch)
+        if len(splitted_ys) < 2:
+            splitted_outs.append({
+                # 'box': np.array(box_info['box']) if type(box_info['box']) == 'list' else box_info['box'],
+                'box': box_info['box'],
+                'score': box_info['score'],
+                'type': 'isolated' if box_info['type'] == 'Equation' else 'embedding',
+            })
+        else:  # append according to ys.
+            last_y = ymin
+            for splitted_y in splitted_ys:
+                splitted_outs.append({'box': np.array(
+                    [[xmin, last_y], [xmax, last_y], [xmax, ymin + splitted_y], [xmin, ymin + splitted_y]]),
+                    'score': box_info['score'],
+                    'type': 'isolated'})
+                last_y = ymin + splitted_y
+
+    return splitted_outs

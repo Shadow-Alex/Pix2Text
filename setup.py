@@ -25,11 +25,8 @@ required = [
     "tqdm",
     "numpy",
     "opencv-python",
-    "cnocr>=2.2.3.1",
-    "cnstd>=1.2.3.2",
     "torch",
     "torchvision",
-    "pix2tex",
 ]
 extras_require = {
     "dev": ["pip-tools", "pytest"],
