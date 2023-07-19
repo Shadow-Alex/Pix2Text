@@ -308,51 +308,10 @@ class Pix2Text(object):
         else:
             img0 = read_img(img, return_type='Image')
         w, h = img0.size
-        ratio = resized_shape / w
-        resized_shape = (int(h * ratio), resized_shape)  # (H, W)
-        analyzer_outs = self.analyzer(img0.copy(), resized_shape=resized_shape)
-        embed_sep = kwargs.get('embed_sep', (' $', '$ '))
-        isolated_sep = kwargs.get('isolated_sep', ('$$\n', '\n$$'))
 
-        hires_outs = self.layout_analyzer(img0.copy(), resized_shape=(1280, 1280))
-
-        # 首先融合 hi-res layout 识别出来的公式与 mfd 识别出来的公式范围，取最大的范围！
-        merged_outs = merge_boxes(hires_outs, analyzer_outs)
-
-        # 如果 Text 和 Isolated Equation 有交集，修剪公式的 bbox
-        merged_outs = trim_equations(hires_outs, merged_outs)
-
-        # 对于融合之后的每个 bbox，再使用分行算法找到空白行并加以切割，拆分成单行公式，生成新的 bbox。
-        splitted_outs = split_equations(merged_outs, img0)
-
-        mf_out = []
-        for box_info in splitted_outs:
-            box = box_info['box']
-            xmin, ymin, xmax, ymax = (
-                int(box[0][0]),
-                int(box[0][1]),
-                int(box[2][0]),
-                int(box[2][1]),
-            )
-            crop_patch = img0.crop((xmin, ymin, xmax, ymax))
-            patch_out = self._latex(crop_patch)
-            if patch_out == '':
-                continue
-            sep = isolated_sep if box_info['type'] == 'isolated' else embed_sep
-            text = sep[0] + patch_out + sep[1]
-            mf_out.append({'type': box_info['type'], 'text': text, 'position': box})
+        hires_outs = self.layout_analyzer(img0.copy(), resized_shape=(640, 640))
 
         img = np.array(img0.copy())
-        # 把公式部分mask掉，然后对其他部分进行OCR
-        for box_info in splitted_outs:
-            if box_info['type'] in ('isolated', 'embedding'):
-                box = box_info['box']
-                xmin, ymin = max(0, int(box[0][0]) - 1), max(0, int(box[0][1]) - 1)
-                xmax, ymax = (
-                    min(img0.size[0], int(box[2][0]) + 1),
-                    min(img0.size[1], int(box[2][1]) + 1),
-                )
-                img[ymin:ymax, xmin:xmax, :] = 255
 
         # 把 Table & Figure 部分mask掉
         for box_info in hires_outs:
@@ -380,31 +339,31 @@ class Pix2Text(object):
                 continue
             line_box = _to_iou_box(hor_box)
             embed_mfs = []
-            for box_info in mf_out:
-                if box_info['type'] == 'embedding':
-                    box2 = _to_iou_box(box_info['position'])
-                    if float(box_partial_overlap(line_box, box2).squeeze()) > 0.7:
-                        embed_mfs.append(
-                            {
-                                'position': box2[0].int().tolist(),
-                                'text': box_info['text'],
-                                'type': box_info['type'],
-                            }
-                        )
 
             ocr_boxes = self._split_line_image(line_box, embed_mfs)
             total_text_boxes.extend(ocr_boxes)
 
-        outs = copy(mf_out)
+        outs = []
+        batch_size = 1
+        crop_patches = []
         for box in total_text_boxes:
             crop_patch = torch.tensor(np.asarray(img0.crop(box['position'])))
-            part_res = self._ocr_for_single_line(crop_patch, 'general')
+            crop_patches.append(crop_patch)
+        part_reses = self._ocr_for_single_lines(crop_patches, 'general', batch_size)
+        for box, part_res in zip(total_text_boxes, part_reses):
             if part_res['text']:
                 box['position'] = list2box(*box['position'])
                 box['text'] = part_res['text']
                 outs.append(box)
 
-        outs = sort_boxes(outs, key='position')
+        # draw = ImageDraw.Draw(img0)
+        # for box in hires_outs:
+        #     bbox = box['box']
+        #     bbox = [(x, y) for x, y in bbox]
+        #     type = box['type']
+        #     draw.polygon(bbox, outline="red")
+        #     draw.text(bbox[0], type, fill="red")
+        # img0.show()
 
         outs = self._custom_process(outs, hires_outs, w)
 
@@ -455,97 +414,58 @@ class Pix2Text(object):
 
             return max_ratio, max_id
 
-        def max_layout_type(layout, bbox_input):
-            _, max_id = max_layout_id(layout, bbox_input)
-            return layout[max_id]['type'] if max_id != -1 else "IDK"
-
-        global last_layout_id
-
-        def layout_sensitive_str(out, layout):
-            global last_layout_id
-            max_ratio, cur_id = max_layout_id(layout, out['position'])
-            # if in same id. no \n.
-            # -1 为通配符。
-            out_text = out['text'].lstrip(' \n').rstrip(' \n')
-            ret = ''
-            if len(out_text) <= 0:
-                return ''
-            # 和之前不属于同一块。换行。例外：之前有 -，使得 last_layout_id = -1
-            if cur_id != last_layout_id and out_text != '' and last_layout_id != -1:
-                ret += '\n'
-            try:
-                if layout[last_layout_id]['type'] == 'Equation':
-                    ret += '\n'
-            except:
-                pass
-            ret += out_text
-            if ret[-1] == '-':
-                last_layout_id = -1
-                ret = ret[:-1]
+        def is_chinese(word):
+            import re
+            pattern = re.compile(r'[^\u4e00-\u9fa5]')
+            if pattern.search(word):
+                return False
             else:
-                last_layout_id = cur_id
-                ret += ' '
-            return ret
+                return True
 
-        new_out = []
-        right_list = []  # right-side cache.
-        mid = width / 2
+        is_ch = False
+        # for each layout-id, find its boxes. If a boxes belongs to nothing, add as a new layout.
+        for out_id, out in enumerate(outs):
+            _, out_layout_id = max_layout_id(layout, out['position'])
+            if out_layout_id == -1: # new block.
+                layout.append({'box':out['position'], 'score':1, "type": 'Text', "outs":[out_id]})
+            else:
+                if "outs" not in layout[out_layout_id].keys():
+                    layout[out_layout_id]['outs'] = [out_id]
+                else:
+                    layout[out_layout_id]['outs'].append(out_id)
 
-        global last_layout_id
-        last_layout_id = -1
-        for line in outs:
-            # bugfix ：Header 和 Footer 属性传播，只要同行中有一个是，就认为其他都是！
-            skip_line = False
-            for out in line:
-                out_type = max_layout_type(layout, out['position'])
-                if out_type in ("Header", "Footer"):
-                    for out_ in line:
-                        out_['type'] = out_type
-                        new_out.append(out_)
-                    skip_line = True
-                    break
-            if skip_line :
+            if is_chinese(out['text']):
+                is_ch = True
+
+        # from top to bottom, left before right. key = 10x + y.
+        sorted(layout, key=lambda x: (x['box'][0][0] + x['box'][1][0]) * 10 + (x['box'][0][1] + x['box'][2][1]))
+
+        new_out_str = ''
+
+        # in each layout-id. print all lines. no \n needed.
+        # between each layout-id, \n needed.
+        for l in layout:
+            if "outs" not in l.keys():
+                continue
+            if l['type'] in ("Footer", 'Header', "Figure", "Table"):
                 continue
 
-            # 推断本行单列还是双列：如果mid处有box，则认为是单列。
-            double_col = True
-            for out in line:
-                if min(point[0] for point in out['position']) < mid < max(
-                        point[0] for point in out['position']):
-                    double_col = False
-                    break
+            boxes = [outs[out_id] for out_id in l["outs"]]
+            lines = sort_boxes(boxes, key='position')
 
-            for out in line:
-                out_type = max_layout_type(layout, out['position'])
-                if out_type in ("Table", "Figure"):
-                    continue
-                if out_type in ("Reference", "Table caption", "Figure caption"):
-                    out['type'] = out_type
-                    new_out.append(out)
-                    continue
+            for line in lines:
+                for box in line:
+                    if not is_ch:
+                        new_out_str += box['text'].strip(' \n') + ' '
+                        if new_out_str[-2:] == '- ': # appl- e.
+                            new_out_str = new_out_str[:-2]
+                    else:
+                        new_out_str += box['text'].strip(' \n')
 
-                if not double_col:
-                    # flush right list.
-                    for cached in right_list:
-                        new_out.append(dict(position=cached['position'],
-                                            text=layout_sensitive_str(cached, layout),
-                                            type='Text'))
-                    right_list = []
-                    new_out.append(dict(position=out['position'],
-                                        text=layout_sensitive_str(out, layout),
-                                        type='Text'))
+            new_out_str += '\n'
 
-                elif mid > max(point[0] for point in out['position']):
-                    new_out.append(dict(position=out['position'],
-                                        text=layout_sensitive_str(out, layout),
-                                        type='Text'))
-                else:
-                    right_list.append(out)
-        # flush.
-        for cached in right_list:
-            new_out.append(dict(position=cached['position'],
-                                text=layout_sensitive_str(cached, layout),
-                                type='Text'))
+        new_out = []
+        new_out.append(dict(text=new_out_str, type='Text'))
 
         return new_out
 
@@ -638,6 +558,13 @@ class Pix2Text(object):
             return ocr_model.ocr_for_single_line(image)
         except:
             return {'text': '', 'score': 0.0}
+
+    def _ocr_for_single_lines(self, images, image_type, batch_size):
+        ocr_model = self.english_ocr if image_type == 'english' else self.general_ocr
+        try:
+            return ocr_model.ocr_for_single_lines(images, batch_size)
+        except:
+            return [{'text': '', 'score': 0.0}]
 
     def _ocr(self, image, image_type):
         ocr_model = self.english_ocr if image_type == 'english' else self.general_ocr
